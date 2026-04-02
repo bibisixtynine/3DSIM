@@ -167,7 +167,7 @@ class InputController: ObservableObject {
             
             // PITCH: stick deflection commands pitch rate (like A320 normal law)
             // Full stick = ~4°/s pitch rate → converted to elevator proportionally
-            physics.elevator = pitchCmd * 0.8
+            physics.elevator = -pitchCmd * 0.8
             
             // ROLL: stick deflection commands roll rate (like A320 normal law)
             // Full stick = ~15°/s roll rate, FBW limits bank to 67°
@@ -290,7 +290,7 @@ class InputController: ObservableObject {
         let deadzone: Float = 0.1
         
         if abs(pitch) > deadzone {
-            physics.elevator = pitch
+            physics.elevator = -pitch
         }
         if abs(roll) > deadzone {
             physics.aileron = roll
