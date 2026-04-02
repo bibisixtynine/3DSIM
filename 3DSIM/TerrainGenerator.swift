@@ -20,7 +20,7 @@ class TerrainGenerator {
     let chunkResolution: Int = 20        // Grid points per chunk side
     let maxMountainHeight: Float = 300.0
     let waterLevel: Float = -2.0
-    let viewDistance: Int = 5            // Chunks to load in each direction
+    let viewDistance: Int = 20           // Chunks to load in each direction
     
     // Noise parameters for terrain generation
     private let seed: UInt64
