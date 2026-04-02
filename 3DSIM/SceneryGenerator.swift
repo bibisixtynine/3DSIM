@@ -27,11 +27,14 @@ class SceneryGenerator {
     let numberOfBirdFlocks = 10
     let numberOfRoadVehicles = 30
     
-    // Store animated entities
-    var aiAircraft: [(entity: Entity, position: SIMD3<Float>, heading: Float, altitude: Float, speed: Float)] = []
-    var helicopters: [(entity: Entity, position: SIMD3<Float>, heading: Float, altitude: Float, orbitCenter: SIMD3<Float>, orbitRadius: Float)] = []
-    var balloons: [(entity: Entity, position: SIMD3<Float>, drift: SIMD3<Float>, baseAltitude: Float)] = []
-    var birdFlocks: [(entity: Entity, position: SIMD3<Float>, heading: Float, altitude: Float, flapPhase: Float)] = []
+    // Store animated entities with cached sub-entity references
+    var aiAircraft: [(entity: Entity, propeller: Entity?, position: SIMD3<Float>, heading: Float, altitude: Float, speed: Float, propAngle: Float)] = []
+    var helicopters: [(entity: Entity, mainRotor: Entity?, tailRotor: Entity?, position: SIMD3<Float>, heading: Float, altitude: Float, orbitCenter: SIMD3<Float>, orbitRadius: Float, mainRotorAngle: Float, tailRotorAngle: Float)] = []
+    var balloons: [(entity: Entity, position: SIMD3<Float>, drift: SIMD3<Float>, baseAltitude: Float, phase: Float)] = []
+    var birdFlocks: [(entity: Entity, wings: [Entity], position: SIMD3<Float>, heading: Float, altitude: Float, flapPhase: Float, headingDrift: Float)] = []
+    
+    /// Cumulative time for animations (avoids Date() calls)
+    private var animationTime: Float = 0
     
     init(terrainGenerator: TerrainGenerator, seed: UInt64 = 54321) {
         self.terrainGenerator = terrainGenerator
@@ -413,7 +416,8 @@ class SceneryGenerator {
             aircraft.orientation = simd_quatf(angle: heading, axis: SIMD3<Float>(0, 1, 0))
             
             aircraftEntity.addChild(aircraft)
-            aiAircraft.append((entity: aircraft, position: aircraft.position, heading: heading, altitude: altitude, speed: speed))
+            let prop = aircraft.findEntity(named: "Propeller")
+            aiAircraft.append((entity: aircraft, propeller: prop, position: aircraft.position, heading: heading, altitude: altitude, speed: speed, propAngle: Float(i) * 1.5))
         }
         
         return aircraftEntity
@@ -577,7 +581,9 @@ class SceneryGenerator {
             heli.position = SIMD3<Float>(x, altitude, z)
             heliRoot.addChild(heli)
             
-            helicopters.append((entity: heli, position: heli.position, heading: angle, altitude: altitude, orbitCenter: orbitCenter, orbitRadius: orbitRadius))
+            let mRotor = heli.findEntity(named: "MainRotor")
+            let tRotor = heli.findEntity(named: "TailRotor")
+            helicopters.append((entity: heli, mainRotor: mRotor, tailRotor: tRotor, position: heli.position, heading: angle, altitude: altitude, orbitCenter: orbitCenter, orbitRadius: orbitRadius, mainRotorAngle: 0, tailRotorAngle: 0))
         }
         
         return heliRoot
@@ -709,7 +715,7 @@ class SceneryGenerator {
                 Float.random(in: -2...2, using: &random)
             )
             
-            balloons.append((entity: balloon, position: balloon.position, drift: drift, baseAltitude: altitude))
+            balloons.append((entity: balloon, position: balloon.position, drift: drift, baseAltitude: altitude, phase: Float(balloons.count) * 0.7))
         }
         
         return balloonRoot
@@ -798,7 +804,14 @@ class SceneryGenerator {
             flock.position = SIMD3<Float>(x, altitude, z)
             birdRoot.addChild(flock)
             
-            birdFlocks.append((entity: flock, position: flock.position, heading: heading, altitude: altitude, flapPhase: Float.random(in: 0...(2 * .pi), using: &random)))
+            // Cache all wing entities for this flock
+            var wingEntities: [Entity] = []
+            for child in flock.children {
+                if let w = child.findEntity(named: "Wings") {
+                    wingEntities.append(w)
+                }
+            }
+            birdFlocks.append((entity: flock, wings: wingEntities, position: flock.position, heading: heading, altitude: altitude, flapPhase: Float.random(in: 0...(2 * .pi), using: &random), headingDrift: Float.random(in: -0.2...0.2, using: &random)))
         }
         
         return birdRoot
@@ -855,139 +868,120 @@ class SceneryGenerator {
     // MARK: - Animation Updates
     
     /// Update all animated scenery (call each frame)
-    func updateAIAircraft(deltaTime: Float) {
-        updateAircraft(deltaTime: deltaTime)
-        updateHelicopters(deltaTime: deltaTime)
-        updateBalloons(deltaTime: deltaTime)
-        updateBirds(deltaTime: deltaTime)
+    func updateAIAircraft(deltaTime: Float, aircraft: Bool = true, helicopters: Bool = true, balloons: Bool = true, birds: Bool = true) {
+        animationTime += deltaTime
+        if aircraft { updateAircraft(deltaTime: deltaTime) }
+        if helicopters { updateHelicopters(deltaTime: deltaTime) }
+        if balloons { updateBalloons(deltaTime: deltaTime) }
+        if birds { updateBirds(deltaTime: deltaTime) }
     }
     
-    /// Update AI aircraft positions
+    /// Update AI aircraft positions — uses cached propeller references
     private func updateAircraft(deltaTime: Float) {
         for i in 0..<aiAircraft.count {
-            var aircraft = aiAircraft[i]
+            var a = aiAircraft[i]
             
-            // Circular flight with slight variation
-            aircraft.heading += deltaTime * 0.08
+            a.heading += deltaTime * 0.08
+            a.position.x += sin(a.heading) * a.speed * deltaTime
+            a.position.z += cos(a.heading) * a.speed * deltaTime
+            a.position.y = a.altitude + sin(a.heading * 2) * 10
             
-            let vx = sin(aircraft.heading) * aircraft.speed * deltaTime
-            let vz = cos(aircraft.heading) * aircraft.speed * deltaTime
+            a.entity.position = a.position
             
-            aircraft.position.x += vx
-            aircraft.position.z += vz
-            aircraft.position.y = aircraft.altitude + sin(aircraft.heading * 2) * 10
+            let qYaw = simd_quatf(angle: a.heading, axis: SIMD3<Float>(0, 1, 0))
+            let qBank = simd_quatf(angle: -0.25, axis: SIMD3<Float>(0, 0, 1))
+            a.entity.orientation = qYaw * qBank
             
-            aircraft.entity.position = aircraft.position
+            // Cached propeller — no findEntity
+            a.propAngle += 30.0 * deltaTime
+            if a.propAngle > 100 * .pi { a.propAngle -= 100 * .pi }
+            a.propeller?.orientation = simd_quatf(angle: a.propAngle, axis: SIMD3<Float>(0, 0, 1))
             
-            // Bank into turns for realism
-            let bankAngle: Float = -0.25
-            let qYaw = simd_quatf(angle: aircraft.heading, axis: SIMD3<Float>(0, 1, 0))
-            let qBank = simd_quatf(angle: bankAngle, axis: SIMD3<Float>(0, 0, 1))
-            aircraft.entity.orientation = qYaw * qBank
-            
-            if let propeller = aircraft.entity.findEntity(named: "Propeller") {
-                let propRotation = simd_quatf(angle: Float(Date().timeIntervalSince1970 * 30), axis: SIMD3<Float>(0, 0, 1))
-                propeller.orientation = propRotation
-            }
-            
-            aiAircraft[i] = aircraft
+            aiAircraft[i] = a
         }
     }
     
-    /// Update helicopter positions and rotor animation
+    /// Update helicopter positions — uses cached rotor references
     private func updateHelicopters(deltaTime: Float) {
         for i in 0..<helicopters.count {
-            var heli = helicopters[i]
+            var h = helicopters[i]
             
-            // Orbit around center point
-            heli.heading += deltaTime * 0.12
+            h.heading += deltaTime * 0.12
+            h.position.x = h.orbitCenter.x + cos(h.heading) * h.orbitRadius
+            h.position.z = h.orbitCenter.z + sin(h.heading) * h.orbitRadius
+            h.position.y = h.altitude + sin(h.heading * 3) * 5
             
-            heli.position.x = heli.orbitCenter.x + cos(heli.heading) * heli.orbitRadius
-            heli.position.z = heli.orbitCenter.z + sin(heli.heading) * heli.orbitRadius
-            heli.position.y = heli.altitude + sin(heli.heading * 3) * 5
+            h.entity.position = h.position
             
-            heli.entity.position = heli.position
-            
-            // Face direction of travel with slight bank
-            let facingAngle = heli.heading + .pi / 2
+            let facingAngle = h.heading + .pi / 2
             let qYaw = simd_quatf(angle: facingAngle, axis: SIMD3<Float>(0, 1, 0))
             let qBank = simd_quatf(angle: -0.15, axis: SIMD3<Float>(0, 0, 1))
-            heli.entity.orientation = qYaw * qBank
+            h.entity.orientation = qYaw * qBank
             
-            // Spin main rotor
-            if let rotor = heli.entity.findEntity(named: "MainRotor") {
-                let rotorAngle = Float(Date().timeIntervalSince1970 * 15)
-                rotor.orientation = simd_quatf(angle: rotorAngle, axis: SIMD3<Float>(0, 1, 0))
-            }
+            // Cached rotors — no findEntity, cumulative angles
+            h.mainRotorAngle += 15.0 * deltaTime
+            if h.mainRotorAngle > 100 * .pi { h.mainRotorAngle -= 100 * .pi }
+            h.mainRotor?.orientation = simd_quatf(angle: h.mainRotorAngle, axis: SIMD3<Float>(0, 1, 0))
             
-            // Spin tail rotor
-            if let tailRotor = heli.entity.findEntity(named: "TailRotor") {
-                let tailAngle = Float(Date().timeIntervalSince1970 * 25)
-                tailRotor.orientation = simd_quatf(angle: tailAngle, axis: SIMD3<Float>(1, 0, 0))
-            }
+            h.tailRotorAngle += 25.0 * deltaTime
+            if h.tailRotorAngle > 100 * .pi { h.tailRotorAngle -= 100 * .pi }
+            h.tailRotor?.orientation = simd_quatf(angle: h.tailRotorAngle, axis: SIMD3<Float>(1, 0, 0))
             
-            helicopters[i] = heli
+            helicopters[i] = h
         }
     }
     
-    /// Update balloon positions with gentle drift
+    /// Update balloon positions — cumulative time, no Date()
     private func updateBalloons(deltaTime: Float) {
         for i in 0..<balloons.count {
-            var balloon = balloons[i]
+            var b = balloons[i]
             
-            // Gentle drift
-            balloon.position += balloon.drift * deltaTime
+            b.position += b.drift * deltaTime
+            b.phase += deltaTime
+            b.position.y = b.baseAltitude + sin(b.phase * 0.3) * 3.0
             
-            // Bob up and down gently
-            let time = Float(Date().timeIntervalSince1970)
-            balloon.position.y = balloon.baseAltitude + sin(time * 0.3 + Float(i)) * 3.0
+            if abs(b.position.x) > 1000 { b.drift.x *= -1 }
+            if abs(b.position.z) > 1000 { b.drift.z *= -1 }
             
-            // Keep balloons within bounds
-            if abs(balloon.position.x) > 1000 { balloon.drift.x *= -1 }
-            if abs(balloon.position.z) > 1000 { balloon.drift.z *= -1 }
+            b.entity.position = b.position
+            b.entity.orientation = simd_quatf(angle: b.phase * 0.05, axis: SIMD3<Float>(0, 1, 0))
             
-            balloon.entity.position = balloon.position
-            
-            // Gentle rotation
-            balloon.entity.orientation = simd_quatf(angle: time * 0.05, axis: SIMD3<Float>(0, 1, 0))
-            
-            balloons[i] = balloon
+            balloons[i] = b
         }
     }
     
-    /// Update bird flock positions with flapping
+    /// Update bird flocks — cached wings, deterministic heading drift
     private func updateBirds(deltaTime: Float) {
-        let time = Float(Date().timeIntervalSince1970)
-        
         for i in 0..<birdFlocks.count {
-            var flock = birdFlocks[i]
+            var f = birdFlocks[i]
             
-            // Fly in gentle curves
-            flock.heading += deltaTime * Float.random(in: -0.3...0.3)
+            // Deterministic gentle curve (no random per frame)
+            f.heading += deltaTime * f.headingDrift
+            // Slowly vary the drift over time
+            f.headingDrift += deltaTime * sin(animationTime * 0.1 + Float(i)) * 0.05
+            f.headingDrift = max(-0.3, min(0.3, f.headingDrift))
             
             let speed: Float = 15.0
-            flock.position.x += sin(flock.heading) * speed * deltaTime
-            flock.position.z += cos(flock.heading) * speed * deltaTime
-            flock.position.y = flock.altitude + sin(time * 0.5 + Float(i) * 2) * 5
+            f.position.x += sin(f.heading) * speed * deltaTime
+            f.position.z += cos(f.heading) * speed * deltaTime
+            f.position.y = f.altitude + sin(animationTime * 0.5 + Float(i) * 2) * 5
             
-            // Keep in bounds
-            if abs(flock.position.x) > 800 || abs(flock.position.z) > 800 {
-                flock.heading += .pi
+            if abs(f.position.x) > 800 || abs(f.position.z) > 800 {
+                f.heading += .pi
             }
             
-            flock.entity.position = flock.position
-            flock.entity.orientation = simd_quatf(angle: flock.heading, axis: SIMD3<Float>(0, 1, 0))
+            f.entity.position = f.position
+            f.entity.orientation = simd_quatf(angle: f.heading, axis: SIMD3<Float>(0, 1, 0))
             
-            // Animate wing flapping for each bird in flock
-            flock.flapPhase += deltaTime * 8
-            for child in flock.entity.children {
-                if let wings = child.findEntity(named: "Wings") {
-                    let flapAngle = sin(flock.flapPhase) * 0.4
-                    wings.orientation = simd_quatf(angle: flapAngle, axis: SIMD3<Float>(0, 0, 1))
-                }
+            // Cached wing entities — no findEntity, no children iteration
+            f.flapPhase += deltaTime * 8
+            let flapAngle = sin(f.flapPhase) * 0.4
+            let flapQuat = simd_quatf(angle: flapAngle, axis: SIMD3<Float>(0, 0, 1))
+            for wing in f.wings {
+                wing.orientation = flapQuat
             }
             
-            birdFlocks[i] = flock
+            birdFlocks[i] = f
         }
     }
 }

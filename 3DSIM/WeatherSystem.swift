@@ -278,10 +278,18 @@ class WeatherSystem {
     
     // MARK: - Update
     
+    /// Accumulated time for throttled updates
+    private var cloudUpdateAccumulator: Float = 0
+    private let cloudUpdateInterval: Float = 0.25  // Update clouds 4x per second
+    
     /// Update weather system each frame
     func update(deltaTime: Float, playerPosition: SIMD3<Float>) {
-        // Move clouds
-        updateClouds(deltaTime: deltaTime)
+        // Clouds move slowly — only update positions periodically
+        cloudUpdateAccumulator += deltaTime
+        if cloudUpdateAccumulator >= cloudUpdateInterval {
+            updateClouds(deltaTime: cloudUpdateAccumulator)
+            cloudUpdateAccumulator = 0
+        }
         
         // Storm timing
         updateStormCycle(deltaTime: deltaTime, playerPosition: playerPosition)
@@ -293,15 +301,13 @@ class WeatherSystem {
         }
     }
     
-    /// Animate cloud movement
+    /// Animate cloud movement — called at reduced frequency
     private func updateClouds(deltaTime: Float) {
         for i in 0..<clouds.count {
             var cloud = clouds[i]
             
-            // Drift clouds
             cloud.basePosition += cloud.speed * deltaTime
             
-            // Wrap around when too far
             if cloud.basePosition.x > 1500 { cloud.basePosition.x = -1500 }
             if cloud.basePosition.x < -1500 { cloud.basePosition.x = 1500 }
             if cloud.basePosition.z > 1500 { cloud.basePosition.z = -1500 }
@@ -383,19 +389,20 @@ class WeatherSystem {
         }
     }
     
-    /// Move rain particles to follow player
+    private var rainCycleOffset: Float = 0
+    
+    /// Move rain to follow player — animate by shifting the whole group
     private func updateRain(deltaTime: Float, playerPosition: SIMD3<Float>) {
         guard let rain = rainEntity else { return }
         
         // Center rain around player
         rain.position = SIMD3<Float>(playerPosition.x, playerPosition.y + 50, playerPosition.z)
         
-        // Animate rain drops falling
-        for child in rain.children {
-            child.position.y -= 80 * deltaTime
-            if child.position.y < -50 {
-                child.position.y = 150
-            }
-        }
+        // Cycle offset to simulate falling — moves the entire rain group
+        rainCycleOffset += 80 * deltaTime
+        if rainCycleOffset > 200 { rainCycleOffset -= 200 }
+        
+        // Shift all drops together by adjusting the root Y — much cheaper than per-drop
+        rain.position.y = playerPosition.y + 50 - rainCycleOffset
     }
 }

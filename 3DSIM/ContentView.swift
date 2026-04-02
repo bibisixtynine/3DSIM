@@ -15,8 +15,10 @@ struct ContentView: View {
     // Game state
     @StateObject private var flightData = FlightDataModel()
     @StateObject private var inputController = InputController()
+    @StateObject private var renderSettings = RenderSettings.shared
     @State private var isPaused = false
     @State private var cameraModeName = "Chase"
+    @State private var showSettings = false
     
     // Core systems (stored for reference)
     @State private var flightPhysics: FlightPhysics?
@@ -26,6 +28,10 @@ struct ContentView: View {
     @State private var weatherSystem: WeatherSystem?
     @State private var playerAircraft: Entity?
     @State private var propellerAngle: Float = 0
+    @State private var propellerEntity: Entity?
+    
+    // Scene entity references for toggling visibility
+    @State private var sceneRoot: Entity?
     
     var body: some View {
         ZStack {
@@ -48,12 +54,117 @@ struct ContentView: View {
             
             // Virtual Controls Overlay - handles all touch/mouse input
             VirtualControlsOverlay(flightData: flightData)
+            
+            // Settings button (top-right)
+            VStack {
+                HStack {
+                    Spacer()
+                    Button(action: { showSettings.toggle() }) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.title2)
+                            .foregroundColor(.white)
+                            .padding(8)
+                            .background(.black.opacity(0.5))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 12)
+                    .padding(.top, 8)
+                }
+                Spacer()
+            }
+            
+            // Settings panel
+            if showSettings {
+                settingsPanel
+            }
         }
         .handleKeyboardInput(with: inputController)
         .onAppear {
             setupInputCallbacks()
             startGameLoop()
         }
+    }
+    
+    /// Settings panel overlay
+    private var settingsPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Paramètres de rendu")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                        Spacer()
+                        Button(action: { showSettings = false }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.gray)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.bottom, 4)
+                    
+                    settingsToggle("Arbres / Forêts", isOn: $renderSettings.showTrees, icon: "tree.fill")
+                    settingsToggle("Maisons", isOn: $renderSettings.showHouses, icon: "house.fill")
+                    settingsToggle("Routes", isOn: $renderSettings.showRoadDetails, icon: "road.lanes")
+                    settingsToggle("Avions IA", isOn: $renderSettings.showAIAircraft, icon: "airplane")
+                    settingsToggle("Hélicoptères", isOn: $renderSettings.showHelicopters, icon: "helicopter.circle")
+                    settingsToggle("Montgolfières", isOn: $renderSettings.showBalloons, icon: "balloon.fill")
+                    settingsToggle("Oiseaux", isOn: $renderSettings.showBirds, icon: "bird.fill")
+                    settingsToggle("Nuages", isOn: $renderSettings.showClouds, icon: "cloud.fill")
+                    settingsToggle("Météo (orage)", isOn: $renderSettings.showWeather, icon: "cloud.bolt.fill")
+                    settingsToggle("Eau", isOn: $renderSettings.showWater, icon: "water.waves")
+                }
+                .padding(14)
+                .frame(width: 240)
+                .background(.ultraThinMaterial)
+                .cornerRadius(12)
+                .shadow(radius: 8)
+                .padding(.trailing, 12)
+                .padding(.top, 50)
+            }
+            Spacer()
+        }
+    }
+    
+    private func settingsToggle(_ label: String, isOn: Binding<Bool>, icon: String) -> some View {
+        Toggle(isOn: isOn) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .frame(width: 18)
+                    .foregroundColor(isOn.wrappedValue ? .blue : .gray)
+                Text(label)
+                    .font(.callout)
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .onChange(of: isOn.wrappedValue) {
+            applyRenderSettings()
+        }
+    }
+    
+    /// Apply current render settings to scene entities
+    private func applyRenderSettings() {
+        guard let root = sceneRoot else { return }
+        
+        func setEnabled(_ name: String, _ enabled: Bool) {
+            root.findEntity(named: name)?.isEnabled = enabled
+        }
+        
+        setEnabled("Forests", renderSettings.showTrees)
+        setEnabled("Houses", renderSettings.showHouses)
+        setEnabled("RoadDetails", renderSettings.showRoadDetails)
+        setEnabled("AIAircraft", renderSettings.showAIAircraft)
+        setEnabled("Helicopters", renderSettings.showHelicopters)
+        setEnabled("Balloons", renderSettings.showBalloons)
+        setEnabled("Birds", renderSettings.showBirds)
+        setEnabled("Clouds", renderSettings.showClouds)
+        setEnabled("StormClouds", renderSettings.showWeather)
+        setEnabled("Lightning", renderSettings.showWeather)
+        setEnabled("Rain", renderSettings.showWeather)
+        setEnabled("Water", renderSettings.showWater)
     }
     
     /// Creates the complete premium cartoon flight simulator scene
@@ -103,6 +214,7 @@ struct ContentView: View {
         aircraft.position = physics.position
         rootEntity.addChild(aircraft)
         playerAircraft = aircraft
+        propellerEntity = aircraft.findEntity(named: "Propeller")
         
         // Add premium cartoon sky
         let sky = createPremiumSkyDome()
@@ -117,6 +229,10 @@ struct ContentView: View {
         
         // Add everything to scene
         content.add(rootEntity)
+        sceneRoot = rootEntity
+        
+        // Apply saved render settings
+        applyRenderSettings()
     }
     
     /// Create premium cartoon sky dome with gradient
@@ -250,8 +366,10 @@ struct ContentView: View {
                 // Update terrain chunks
                 terrainGenerator?.updateChunks(playerPosition: physics.position)
                 
-                // Update weather system
-                weatherSystem?.update(deltaTime: deltaTime, playerPosition: physics.position)
+                // Update weather system (skip if clouds + weather both off)
+                if renderSettings.showClouds || renderSettings.showWeather {
+                    weatherSystem?.update(deltaTime: deltaTime, playerPosition: physics.position)
+                }
                 
                 // Update flight data for HUD
                 DispatchQueue.main.async {
@@ -263,14 +381,11 @@ struct ContentView: View {
                     aircraft.position = physics.position
                     aircraft.orientation = physics.getRotationQuaternion()
                     
-                    if let propeller = aircraft.findEntity(named: "Propeller") {
-                        // Prop speed: idle ~10 rad/s, full throttle ~80 rad/s, plus windmilling from airspeed
+                    if let propeller = propellerEntity {
                         let idleSpeed: Float = physics.throttle > 0.01 ? 10.0 : 0.0
                         let throttleSpeed = physics.throttle * 70.0
                         let windmillSpeed = min(physics.airspeed * 0.3, 30.0)
-                        let propSpeed = idleSpeed + throttleSpeed + windmillSpeed
-                        propellerAngle += propSpeed * deltaTime
-                        // Keep angle bounded to avoid float precision loss
+                        propellerAngle += (idleSpeed + throttleSpeed + windmillSpeed) * deltaTime
                         if propellerAngle > 100 * .pi { propellerAngle -= 100 * .pi }
                         propeller.orientation = simd_quatf(angle: propellerAngle, axis: SIMD3<Float>(0, 0, 1))
                     }
@@ -280,8 +395,15 @@ struct ContentView: View {
             // Update camera
             cameraSystem?.update(deltaTime: deltaTime)
             
-            // Update AI aircraft, helicopters, balloons, birds
-            sceneryGenerator?.updateAIAircraft(deltaTime: deltaTime)
+            // Update AI aircraft, helicopters, balloons, birds (skip if all off)
+            if renderSettings.showAIAircraft || renderSettings.showHelicopters ||
+               renderSettings.showBalloons || renderSettings.showBirds {
+                sceneryGenerator?.updateAIAircraft(deltaTime: deltaTime,
+                    aircraft: renderSettings.showAIAircraft,
+                    helicopters: renderSettings.showHelicopters,
+                    balloons: renderSettings.showBalloons,
+                    birds: renderSettings.showBirds)
+            }
         }
     }
 }
