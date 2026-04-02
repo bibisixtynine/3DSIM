@@ -86,16 +86,21 @@ class CameraSystem {
         
         // Smooth camera movement (except cockpit which should be rigid)
         if currentMode == .cockpit {
-            currentCameraPosition = targetPosition
-            currentCameraTarget = lookAtTarget
+            // Cockpit: camera is rigidly attached to aircraft — inherits full orientation
+            // so the horizon tilts when the aircraft banks (like a real cockpit)
+            camera.position = targetPosition
+            let aircraftQuat = physics.getRotationQuaternion()
+            // Rotate 180° around Y because camera looks toward -Z but aircraft forward is +Z
+            let flipToCamera = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
+            camera.orientation = aircraftQuat * flipToCamera
         } else {
             currentCameraPosition = mix(currentCameraPosition, targetPosition, t: smoothingFactor)
             currentCameraTarget = mix(currentCameraTarget, lookAtTarget, t: smoothingFactor)
+            
+            // Apply camera transform
+            camera.position = currentCameraPosition
+            camera.look(at: currentCameraTarget, from: currentCameraPosition, relativeTo: nil)
         }
-        
-        // Apply camera transform
-        camera.position = currentCameraPosition
-        camera.look(at: currentCameraTarget, from: currentCameraPosition, relativeTo: nil)
     }
     
     /// Calculate cockpit view position and orientation
