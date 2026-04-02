@@ -483,16 +483,35 @@ class SceneryGenerator {
         engineEntity.position = SIMD3<Float>(0, 0, 3.2)
         aircraftEntity.addChild(engineEntity)
         
-        // Propeller
-        let propMesh = MeshResource.generateBox(size: SIMD3<Float>(0.1, 2.0, 0.2))
+        // Propeller hub + 2 blades
+        let propHub = Entity()
+        propHub.position = SIMD3<Float>(0, 0, 3.7)
+        propHub.name = "Propeller"
+        aircraftEntity.addChild(propHub)
+        
+        let propMesh = MeshResource.generateBox(size: SIMD3<Float>(0.1, 2.0, 0.15))
         var propMaterial = SimpleMaterial()
         propMaterial.color = .init(tint: UIColor(red: 0.15, green: 0.15, blue: 0.15, alpha: 1.0))
         
-        let propEntity = Entity()
-        propEntity.components.set(ModelComponent(mesh: propMesh, materials: [propMaterial]))
-        propEntity.position = SIMD3<Float>(0, 0, 3.7)
-        propEntity.name = "Propeller"
-        aircraftEntity.addChild(propEntity)
+        // Blade 1 (vertical)
+        let blade1 = Entity()
+        blade1.components.set(ModelComponent(mesh: propMesh, materials: [propMaterial]))
+        propHub.addChild(blade1)
+        
+        // Blade 2 (horizontal, rotated 90°)
+        let blade2 = Entity()
+        blade2.components.set(ModelComponent(mesh: propMesh, materials: [propMaterial]))
+        blade2.orientation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(0, 0, 1))
+        propHub.addChild(blade2)
+        
+        // Spinner cone
+        let spinnerMesh = MeshResource.generateSphere(radius: 0.15)
+        var spinnerMat = SimpleMaterial()
+        spinnerMat.color = .init(tint: UIColor(red: 0.2, green: 0.2, blue: 0.22, alpha: 1.0))
+        let spinner = Entity()
+        spinner.components.set(ModelComponent(mesh: spinnerMesh, materials: [spinnerMat]))
+        spinner.position = SIMD3<Float>(0, 0, 0.1)
+        propHub.addChild(spinner)
         
         // Landing gear
         let gearMesh = MeshResource.generateBox(size: SIMD3<Float>(0.15, 1.0, 0.15))

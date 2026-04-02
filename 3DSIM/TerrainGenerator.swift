@@ -20,7 +20,7 @@ class TerrainGenerator {
     let chunkResolution: Int = 20        // Grid points per chunk side
     let maxMountainHeight: Float = 300.0
     let waterLevel: Float = -2.0
-    let viewDistance: Int = 20           // Chunks to load in each direction
+    let viewDistance: Int = 40           // Chunks to load in each direction
     
     // Noise parameters for terrain generation
     private let seed: UInt64
@@ -30,10 +30,40 @@ class TerrainGenerator {
     private var terrainRoot: Entity?
     private var waterEntity: Entity?
     
+    // Background generation
+    private let generationQueue = DispatchQueue(label: "terrain.generation", qos: .utility)
+    /// Chunks whose mesh data has been computed in background, ready to materialize
+    private var readyChunks: [(coord: ChunkCoord, data: ChunkMeshData)] = []
+    /// Chunks currently being generated in background
+    private var generatingChunks: Set<ChunkCoord> = []
+    private let readyLock = NSLock()
+    
+    // Progressive loading
+    private var chunkLoadQueue: [ChunkCoord] = []
+    private var currentPlayerChunkX: Int = Int.min
+    private var currentPlayerChunkZ: Int = Int.min
+    
+    /// Max chunks to materialize (add to scene) per frame — the lightweight part
+    private let maxMaterializePerFrame: Int = 2
+    /// Max background generation tasks to dispatch at once
+    private let maxPendingGenerations: Int = 8
+    /// Max chunks to remove per frame
+    private let maxRemovalsPerFrame: Int = 10
+    
     // Chunk coordinate type
     struct ChunkCoord: Hashable {
         let x: Int
         let z: Int
+    }
+    
+    /// Pre-computed mesh data — generated on background thread
+    private struct ChunkMeshData {
+        let positions: [SIMD3<Float>]
+        let normals: [SIMD3<Float>]
+        let uvs: [SIMD2<Float>]
+        let indices: [UInt32]
+        let color: (r: CGFloat, g: CGFloat, b: CGFloat)
+        let resolution: Int
     }
     
     init(seed: UInt64 = 12345) {
@@ -51,56 +81,138 @@ class TerrainGenerator {
         terrainEntity.addChild(water)
         waterEntity = water
         
-        // Load initial chunks around origin
-        updateChunks(playerPosition: SIMD3<Float>(0, 0, 0))
+        // Synchronously preload a small area around origin (runway must be visible)
+        let preloadRadius = 4
+        for dx in -preloadRadius...preloadRadius {
+            for dz in -preloadRadius...preloadRadius {
+                let coord = ChunkCoord(x: dx, z: dz)
+                let data = computeChunkMeshData(chunkX: dx, chunkZ: dz, distSq: 0)
+                let entity = materializeChunk(coord: coord, data: data)
+                terrainEntity.addChild(entity)
+                loadedChunks[coord] = entity
+            }
+        }
+        
+        // Queue the rest for progressive background loading
+        currentPlayerChunkX = 0
+        currentPlayerChunkZ = 0
+        rebuildLoadQueue(centerX: 0, centerZ: 0)
         
         return terrainEntity
     }
     
-    /// Update loaded chunks based on player position - call each frame
+    /// Update loaded chunks based on player position — call each frame.
+    /// Heavy mesh computation runs on a background thread. Only lightweight
+    /// materialization (MeshResource creation + scene insertion) happens here,
+    /// limited to a small number per frame to guarantee smooth frame rate.
     func updateChunks(playerPosition: SIMD3<Float>) {
         guard let root = terrainRoot else { return }
         
-        // Calculate current chunk
-        let currentChunkX = Int(floor(playerPosition.x / chunkWorldSize))
-        let currentChunkZ = Int(floor(playerPosition.z / chunkWorldSize))
+        let chunkX = Int(floor(playerPosition.x / chunkWorldSize))
+        let chunkZ = Int(floor(playerPosition.z / chunkWorldSize))
         
-        // Determine which chunks should be loaded
-        var neededChunks: Set<ChunkCoord> = []
-        for dx in -viewDistance...viewDistance {
-            for dz in -viewDistance...viewDistance {
-                neededChunks.insert(ChunkCoord(x: currentChunkX + dx, z: currentChunkZ + dz))
+        // Rebuild load queue when player enters a new chunk
+        if chunkX != currentPlayerChunkX || chunkZ != currentPlayerChunkZ {
+            currentPlayerChunkX = chunkX
+            currentPlayerChunkZ = chunkZ
+            rebuildLoadQueue(centerX: chunkX, centerZ: chunkZ)
+        }
+        
+        // --- Unload distant chunks (limited per frame) ---
+        let unloadMargin = viewDistance + 2
+        var removals = 0
+        for coord in Array(loadedChunks.keys) {
+            if removals >= maxRemovalsPerFrame { break }
+            let dx = abs(coord.x - chunkX)
+            let dz = abs(coord.z - chunkZ)
+            if dx > unloadMargin || dz > unloadMargin {
+                if let entity = loadedChunks[coord] {
+                    entity.removeFromParent()
+                    loadedChunks.removeValue(forKey: coord)
+                    removals += 1
+                }
             }
         }
         
-        // Unload chunks that are too far
-        let chunksToRemove = loadedChunks.keys.filter { !neededChunks.contains($0) }
-        for coord in chunksToRemove {
-            if let entity = loadedChunks[coord] {
-                entity.removeFromParent()
-                loadedChunks.removeValue(forKey: coord)
+        // --- Dispatch background generation for queued chunks ---
+        var dispatched = 0
+        while generatingChunks.count < maxPendingGenerations && !chunkLoadQueue.isEmpty && dispatched < maxPendingGenerations {
+            let coord = chunkLoadQueue.removeFirst()
+            if loadedChunks[coord] != nil || generatingChunks.contains(coord) { continue }
+            let dx = abs(coord.x - chunkX)
+            let dz = abs(coord.z - chunkZ)
+            if dx > viewDistance || dz > viewDistance { continue }
+            
+            generatingChunks.insert(coord)
+            let distSq = dx * dx + dz * dz
+            generationQueue.async { [weak self] in
+                guard let self = self else { return }
+                let data = self.computeChunkMeshData(chunkX: coord.x, chunkZ: coord.z, distSq: distSq)
+                self.readyLock.lock()
+                self.readyChunks.append((coord: coord, data: data))
+                self.readyLock.unlock()
             }
+            dispatched += 1
         }
         
-        // Load new chunks
-        for coord in neededChunks {
-            if loadedChunks[coord] == nil {
-                let chunk = generateChunk(chunkX: coord.x, chunkZ: coord.z)
-                root.addChild(chunk)
-                loadedChunks[coord] = chunk
-            }
+        // --- Materialize ready chunks (main thread, lightweight) ---
+        readyLock.lock()
+        let batch = readyChunks.prefix(maxMaterializePerFrame)
+        readyChunks.removeFirst(min(maxMaterializePerFrame, readyChunks.count))
+        readyLock.unlock()
+        
+        for item in batch {
+            generatingChunks.remove(item.coord)
+            if loadedChunks[item.coord] != nil { continue }
+            let dx = abs(item.coord.x - chunkX)
+            let dz = abs(item.coord.z - chunkZ)
+            if dx > unloadMargin || dz > unloadMargin { continue }
+            
+            let entity = materializeChunk(coord: item.coord, data: item.data)
+            root.addChild(entity)
+            loadedChunks[item.coord] = entity
         }
         
         // Update water position to follow player
         waterEntity?.position = SIMD3<Float>(playerPosition.x, waterLevel, playerPosition.z)
     }
     
-    /// Generates a single terrain chunk at the given chunk coordinates
-    private func generateChunk(chunkX: Int, chunkZ: Int) -> Entity {
-        let entity = Entity()
-        entity.name = "Chunk_\(chunkX)_\(chunkZ)"
+    /// Rebuild the chunk load queue, sorted by distance from center (closest first)
+    private func rebuildLoadQueue(centerX: Int, centerZ: Int) {
+        chunkLoadQueue.removeAll()
         
-        let cellSize = chunkWorldSize / Float(chunkResolution)
+        for dx in -viewDistance...viewDistance {
+            for dz in -viewDistance...viewDistance {
+                let coord = ChunkCoord(x: centerX + dx, z: centerZ + dz)
+                if loadedChunks[coord] == nil && !generatingChunks.contains(coord) {
+                    chunkLoadQueue.append(coord)
+                }
+            }
+        }
+        
+        chunkLoadQueue.sort { a, b in
+            let da = (a.x - centerX) * (a.x - centerX) + (a.z - centerZ) * (a.z - centerZ)
+            let db = (b.x - centerX) * (b.x - centerX) + (b.z - centerZ) * (b.z - centerZ)
+            return da < db
+        }
+    }
+    
+    /// Compute all mesh data for a chunk — SAFE to call from any thread.
+    /// Uses LOD: distant chunks get fewer vertices.
+    private func computeChunkMeshData(chunkX: Int, chunkZ: Int, distSq: Int) -> ChunkMeshData {
+        // LOD: reduce resolution for distant chunks
+        let res: Int
+        if distSq > 600 {       // > ~24 chunks away
+            res = 2
+        } else if distSq > 200 { // > ~14 chunks away
+            res = 4
+        } else if distSq > 80 {  // > ~9 chunks away
+            res = 8
+        } else {
+            res = chunkResolution
+        }
+        
+        let cellSize = chunkWorldSize / Float(res)
         let chunkOriginX = Float(chunkX) * chunkWorldSize
         let chunkOriginZ = Float(chunkZ) * chunkWorldSize
         
@@ -109,21 +221,23 @@ class TerrainGenerator {
         var uvs: [SIMD2<Float>] = []
         var indices: [UInt32] = []
         
-        // Generate vertices
-        for z in 0...chunkResolution {
-            for x in 0...chunkResolution {
+        positions.reserveCapacity((res + 1) * (res + 1))
+        normals.reserveCapacity((res + 1) * (res + 1))
+        uvs.reserveCapacity((res + 1) * (res + 1))
+        indices.reserveCapacity(res * res * 6)
+        
+        for z in 0...res {
+            for x in 0...res {
                 let worldX = chunkOriginX + Float(x) * cellSize
                 let worldZ = chunkOriginZ + Float(z) * cellSize
                 let height = getHeightAt(x: worldX, z: worldZ)
-                
                 positions.append(SIMD3<Float>(worldX, height, worldZ))
-                uvs.append(SIMD2<Float>(Float(x) / Float(chunkResolution), Float(z) / Float(chunkResolution)))
+                uvs.append(SIMD2<Float>(Float(x) / Float(res), Float(z) / Float(res)))
             }
         }
         
-        // Calculate normals
-        for z in 0...chunkResolution {
-            for x in 0...chunkResolution {
+        for z in 0...res {
+            for x in 0...res {
                 let worldX = chunkOriginX + Float(x) * cellSize
                 let worldZ = chunkOriginZ + Float(z) * cellSize
                 let normal = calculateNormal(x: worldX, z: worldZ, cellSize: cellSize)
@@ -131,39 +245,39 @@ class TerrainGenerator {
             }
         }
         
-        // Generate indices for triangles
-        for z in 0..<chunkResolution {
-            for x in 0..<chunkResolution {
-                let topLeft = UInt32(z * (chunkResolution + 1) + x)
-                let topRight = topLeft + 1
-                let bottomLeft = UInt32((z + 1) * (chunkResolution + 1) + x)
-                let bottomRight = bottomLeft + 1
-                
-                indices.append(topLeft)
-                indices.append(bottomLeft)
-                indices.append(topRight)
-                
-                indices.append(topRight)
-                indices.append(bottomLeft)
-                indices.append(bottomRight)
+        for z in 0..<res {
+            for x in 0..<res {
+                let tl = UInt32(z * (res + 1) + x)
+                let tr = tl + 1
+                let bl = UInt32((z + 1) * (res + 1) + x)
+                let br = bl + 1
+                indices.append(contentsOf: [tl, bl, tr, tr, bl, br])
             }
         }
         
-        // Create mesh
+        let color = getTerrainColorRGB(chunkX: chunkX, chunkZ: chunkZ)
+        
+        return ChunkMeshData(positions: positions, normals: normals, uvs: uvs,
+                             indices: indices, color: color, resolution: res)
+    }
+    
+    /// Create a RealityKit Entity from pre-computed mesh data — call on main thread only.
+    private func materializeChunk(coord: ChunkCoord, data: ChunkMeshData) -> Entity {
+        let entity = Entity()
+        entity.name = "Chunk_\(coord.x)_\(coord.z)"
+        
         var meshDescriptor = MeshDescriptor()
-        meshDescriptor.positions = MeshBuffer(positions)
-        meshDescriptor.normals = MeshBuffer(normals)
-        meshDescriptor.textureCoordinates = MeshBuffer(uvs)
-        meshDescriptor.primitives = .triangles(indices)
+        meshDescriptor.positions = MeshBuffer(data.positions)
+        meshDescriptor.normals = MeshBuffer(data.normals)
+        meshDescriptor.textureCoordinates = MeshBuffer(data.uvs)
+        meshDescriptor.primitives = .triangles(data.indices)
         
         do {
             let mesh = try MeshResource.generate(from: [meshDescriptor])
-            
             var material = PhysicallyBasedMaterial()
-            material.baseColor = .init(tint: getTerrainColor(chunkX: chunkX, chunkZ: chunkZ))
+            material.baseColor = .init(tint: UIColor(red: data.color.r, green: data.color.g, blue: data.color.b, alpha: 1.0))
             material.roughness = .init(floatLiteral: 0.9)
             material.metallic = .init(floatLiteral: 0.0)
-            
             entity.components.set(ModelComponent(mesh: mesh, materials: [material]))
         } catch {
             print("Failed to generate terrain chunk: \(error)")
@@ -213,41 +327,38 @@ class TerrainGenerator {
         return forestNoise > 0.1 && distFromAirport > 300 && !isRoad(x: x, z: z) && !isLake(x: x, z: z)
     }
     
-    /// Gets terrain color - premium cartoon style with vibrant colors
-    private func getTerrainColor(chunkX: Int, chunkZ: Int) -> UIColor {
+    /// Gets terrain color as RGB tuple — thread-safe (no UIColor creation)
+    private func getTerrainColorRGB(chunkX: Int, chunkZ: Int) -> (r: CGFloat, g: CGFloat, b: CGFloat) {
         let centerX = Float(chunkX) * chunkWorldSize + chunkWorldSize / 2
         let centerZ = Float(chunkZ) * chunkWorldSize + chunkWorldSize / 2
         let height = getHeightAt(x: centerX, z: centerZ)
         
         // Roads - dark asphalt gray
         if isRoad(x: centerX, z: centerZ) && height > waterLevel + 1 && height < 80 {
-            return UIColor(red: 0.25, green: 0.25, blue: 0.28, alpha: 1.0)
+            return (0.25, 0.25, 0.28)
         }
         
-        // Snow caps - bright white with slight blue tint (cartoon)
+        // Snow caps
         if height > maxMountainHeight * 0.75 {
-            return UIColor(red: 0.95, green: 0.97, blue: 1.0, alpha: 1.0)
+            return (0.95, 0.97, 1.0)
         }
-        // Rocky mountains - warm purple-gray (cartoon style)
+        // Rocky mountains
         else if height > maxMountainHeight * 0.5 {
-            return UIColor(red: 0.55, green: 0.48, blue: 0.52, alpha: 1.0)
+            return (0.55, 0.48, 0.52)
         }
         // Sandy beach near water
         else if height < waterLevel + 3 && height > waterLevel - 1 {
-            return UIColor(red: 0.93, green: 0.87, blue: 0.65, alpha: 1.0)
+            return (0.93, 0.87, 0.65)
         }
-        // Forest zones - rich dark green cartoon style
+        // Forest zones
         else if isForest(x: centerX, z: centerZ) {
-            let variation = noise2D(x: centerX * 0.02, y: centerZ * 0.02)
-            let green = 0.45 + CGFloat(variation * 0.1)
-            return UIColor(red: 0.15, green: green, blue: 0.18, alpha: 1.0)
+            let variation = CGFloat(noise2D(x: centerX * 0.02, y: centerZ * 0.02))
+            return (0.15, 0.45 + variation * 0.1, 0.18)
         }
-        // Default grass - vibrant cartoon green with warm variation
+        // Default grass
         else {
-            let variation = noise2D(x: centerX * 0.01, y: centerZ * 0.01)
-            let green = 0.55 + CGFloat(variation * 0.12)
-            let red = 0.30 + CGFloat(variation * 0.05)
-            return UIColor(red: red, green: green, blue: 0.22, alpha: 1.0)
+            let variation = CGFloat(noise2D(x: centerX * 0.01, y: centerZ * 0.01))
+            return (0.30 + variation * 0.05, 0.55 + variation * 0.12, 0.22)
         }
     }
     

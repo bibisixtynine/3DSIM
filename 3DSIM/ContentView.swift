@@ -25,6 +25,7 @@ struct ContentView: View {
     @State private var terrainGenerator: TerrainGenerator?
     @State private var weatherSystem: WeatherSystem?
     @State private var playerAircraft: Entity?
+    @State private var propellerAngle: Float = 0
     
     var body: some View {
         ZStack {
@@ -263,12 +264,15 @@ struct ContentView: View {
                     aircraft.orientation = physics.getRotationQuaternion()
                     
                     if let propeller = aircraft.findEntity(named: "Propeller") {
-                        let propSpeed = physics.throttle * 50.0
-                        let propRotation = simd_quatf(
-                            angle: Float(Date().timeIntervalSince1970 * Double(propSpeed)),
-                            axis: SIMD3<Float>(0, 0, 1)
-                        )
-                        propeller.orientation = propRotation
+                        // Prop speed: idle ~10 rad/s, full throttle ~80 rad/s, plus windmilling from airspeed
+                        let idleSpeed: Float = physics.throttle > 0.01 ? 10.0 : 0.0
+                        let throttleSpeed = physics.throttle * 70.0
+                        let windmillSpeed = min(physics.airspeed * 0.3, 30.0)
+                        let propSpeed = idleSpeed + throttleSpeed + windmillSpeed
+                        propellerAngle += propSpeed * deltaTime
+                        // Keep angle bounded to avoid float precision loss
+                        if propellerAngle > 100 * .pi { propellerAngle -= 100 * .pi }
+                        propeller.orientation = simd_quatf(angle: propellerAngle, axis: SIMD3<Float>(0, 0, 1))
                     }
                 }
             }
